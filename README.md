@@ -4,6 +4,24 @@ Asistente de voz para **Linux y Windows** que controla el escritorio completo us
 
 ![Linux](https://img.shields.io/badge/Linux-KDE_Plasma_6-blue) ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows) ![Python](https://img.shields.io/badge/Python-3.11+-green) ![Claude](https://img.shields.io/badge/Claude-Sonnet_4-orange)
 
+## ⚠️ Importante antes de usar
+
+> **Esta aplicación le da a Claude acceso total a tu computador.** Antes de instalarla, ten en cuenta lo siguiente:
+
+- **Claude Code CLI con sesión activa** — necesitas tener [Claude Code](https://claude.ai/download) instalado y haber iniciado sesión. La aplicación usa tu cuenta para procesar cada consulta, lo que **consume créditos o tokens** según tu plan de Anthropic.
+
+- **Acceso completo al sistema** — Claude puede leer archivos, ejecutar comandos, instalar software, mover el mouse y presionar teclas. Esto es intencional para que pueda controlar el escritorio, pero significa que **no debes usarlo en un computador con información sensible** a menos que confíes completamente en lo que le vas a pedir.
+
+- **Acceso al micrófono** — la aplicación graba audio cada vez que presionas Alt+Z. La transcripción se hace **localmente** con Whisper (sin internet), pero el texto transcrito sí se envía a los servidores de Anthropic para generar la respuesta.
+
+- **Acceso a dispositivos de entrada (Linux)** — para capturar el atajo Alt+Z globalmente, el daemon lee directamente los dispositivos de teclado. Puede ser necesario agregar tu usuario al grupo `input`:
+  ```bash
+  sudo usermod -aG input $USER
+  # Cerrar sesión y volver a entrar para que tome efecto
+  ```
+
+- **No es oficial de Anthropic** — este es un proyecto personal e independiente, no tiene afiliación con Anthropic.
+
 ## Características
 
 - **Alt+Z** — primer press graba, segundo press transcribe y responde
