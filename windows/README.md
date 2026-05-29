@@ -11,7 +11,7 @@ Misma experiencia que la versión Linux: **Alt+Z** para hablar, Claude controla 
 
 ## Instalación rápida
 
-Abrí PowerShell **como administrador** y ejecutá:
+Abre PowerShell **como administrador** y ejecuta:
 
 ```powershell
 cd C:\ruta\donde\clonaste\claude-voice
@@ -53,7 +53,7 @@ venv\Scripts\pythonw.exe windows\claude-voice-daemon.py
 
 El instalador ya lo configura. Si querés hacerlo manualmente:
 
-1. Presioná `Win+R` → escribí `shell:startup` → Enter
+1. Presiona `Win+R` → escribe `shell:startup` → Enter
 2. Copia `launcher.vbs` ahí (o crea un acceso directo)
 
 ## Diferencias con la versión Linux

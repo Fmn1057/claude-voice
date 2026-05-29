@@ -13,7 +13,7 @@ Asistente de voz para **Linux y Windows** que controla el escritorio completo us
 - Transcripción local con **faster-whisper** (sin internet, sin costo)
 - Voz neural en español con **edge-tts** (Microsoft Neural, es-MX-DaliaNeural)
 - Sesión persistente multi-turno con **Claude Agent SDK**
-- Captura de pantalla automática cuando le preguntás sobre lo que ves
+- Captura de pantalla automática cuando le preguntas sobre lo que ves
 - Control total del escritorio: mouse, teclado, ventanas, apps, archivos
 - Instala apps, crea documentos, controla Spotify, y más
 
@@ -76,12 +76,12 @@ El instalador crea el venv, instala dependencias, instala mpv y configura el aut
 
 ### Ejemplos de comandos de voz
 
-- *"Abrí Firefox y buscá el clima de Santiago"*
+- *"Abre Firefox y busca el clima de Santiago"*
 - *"¿Qué caja ves en pantalla?"* — toma screenshot automáticamente
-- *"Instalá Visual Studio Code"*
-- *"Creá una presentación sobre perros y gatos en el escritorio"*
-- *"Poné música aleatoria en Spotify"*
-- *"Cerrá Discord"*
+- *"Instala Visual Studio Code"*
+- *"Crea una presentación sobre perros y gatos en el escritorio"*
+- *"Pon música aleatoria en Spotify"*
+- *"Cierra Discord"*
 
 ## Estructura del proyecto
 
@@ -149,7 +149,7 @@ systemctl --user restart claude-voice.service
 ## Notas
 
 - **Juegos en fullscreen (CS2, etc.)**: si el screenshot sale negro, el juego está bloqueando la captura del compositor. Claude igual puede ayudar con comandos de consola del juego.
-- **sudo sin contraseña**: para que Claude pueda instalar paquetes, configurá `NOPASSWD` en sudoers:
+- **sudo sin contraseña**: para que Claude pueda instalar paquetes, configura `NOPASSWD` en sudoers:
   ```bash
   echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/claude-voice
   sudo chmod 440 /etc/sudoers.d/claude-voice
