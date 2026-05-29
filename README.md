@@ -2,7 +2,9 @@
 
 Asistente de voz para Linux que controla el escritorio completo usando Claude AI. Activado con **Alt+Z**, transcribe tu voz con Whisper, la envía a Claude con acceso total al sistema, y responde por voz con síntesis de audio neural.
 
-![Demo overlay](https://img.shields.io/badge/KDE_Plasma_6-Wayland-blue) ![Python](https://img.shields.io/badge/Python-3.11+-green) ![Claude](https://img.shields.io/badge/Claude-Sonnet_4-orange)
+![Linux](https://img.shields.io/badge/Linux-KDE_Plasma_6-blue) ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows) ![Python](https://img.shields.io/badge/Python-3.11+-green) ![Claude](https://img.shields.io/badge/Claude-Sonnet_4-orange)
+
+> **Windows:** ver [windows/README.md](windows/README.md)
 
 ## Características
 

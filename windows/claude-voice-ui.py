@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+Claude Voice — Overlay flotante
+Escucha mensajes del daemon via Unix socket y muestra la conversación.
+"""
+
+import sys
+import os
+import json
+import socket
+import threading
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
+
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy, QScrollArea, QFrame
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve, QPoint
+from PyQt6.QtGui import QFont, QFontMetrics, QColor, QPainter, QPainterPath, QLinearGradient
+
+import os, tempfile; SOCK_PATH = os.path.join(tempfile.gettempdir(), ".claude-voice.sock")
+
+# ── Paleta ────────────────────────────────────────────────────────────────────
+BG         = "#0f1117"
+BG_ALPHA   = 220          # 0-255
+BORDER     = "#2a2d3a"
+USER_COL   = "#7c8cf8"    # azul/morado para mensajes del usuario
+CLAUDE_COL = "#e2e8f0"    # blanco suave para respuestas
+STATUS_COL = "#64748b"    # gris para estado
+DOT_REC    = "#ef4444"    # rojo para grabando
+DOT_PROC   = "#f59e0b"    # amarillo para procesando
+DOT_SPEAK  = "#22c55e"    # verde para hablando
+DOT_IDLE   = "#374151"    # gris para idle
+FONT_MONO  = "JetBrains Mono,Fira Code,Cascadia Code,Monospace"
+FONT_SIZE  = 13
+
+# ── Señales (cross-thread) ────────────────────────────────────────────────────
+class Signals(QObject):
+    show_window      = pyqtSignal()
+    hide_window      = pyqtSignal()
+    add_user         = pyqtSignal(str)
+    add_assistant    = pyqtSignal(str)
+    assistant_start  = pyqtSignal()
+    assistant_chunk  = pyqtSignal(str)
+    assistant_end    = pyqtSignal()
+    set_state        = pyqtSignal(str)   # idle | recording | processing | speaking
+
+signals = Signals()
+
+
+# ── Widget de burbuja de mensaje ──────────────────────────────────────────────
+class MessageLabel(QLabel):
+    def __init__(self, text: str, role: str):
+        super().__init__()
+        prefix = "> " if role == "user" else "  "
+        color  = USER_COL if role == "user" else CLAUDE_COL
+        # Wrap long text
+        wrapped = self._wrap(prefix + text, 58)
+        self.setText(wrapped)
+        self.setFont(QFont(FONT_MONO, FONT_SIZE))
+        self.setStyleSheet(f"""
+            color: {color};
+            background: transparent;
+            padding: 2px 0px;
+        """)
+        self.setWordWrap(True)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+
+    def _wrap(self, text: str, width: int) -> str:
+        """Soft-wrap text at word boundaries."""
+        import textwrap
+        lines = []
+        for line in text.splitlines():
+            if len(line) <= width:
+                lines.append(line)
+            else:
+                indent = "  " if line.startswith("  ") else ""
+                wrapped = textwrap.wrap(line, width, subsequent_indent=indent)
+                lines.extend(wrapped)
+        return "\n".join(lines)
+
+
+# ── Indicador de estado ───────────────────────────────────────────────────────
+class StatusBar(QWidget):
+    STATE_LABELS = {
+        "idle":       ("", DOT_IDLE),
+        "recording":  ("Escuchando...", DOT_REC),
+        "processing": ("Procesando...", DOT_PROC),
+        "speaking":   ("Hablando...",   DOT_SPEAK),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self._state = "idle"
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(8)
+
+        self.dot = QLabel("●")
+        self.dot.setFont(QFont(FONT_MONO, 10))
+        self.dot.setFixedWidth(14)
+
+        self.label = QLabel("")
+        self.label.setFont(QFont(FONT_MONO, FONT_SIZE - 1))
+        self.label.setStyleSheet(f"color: {STATUS_COL};")
+
+        layout.addWidget(self.dot)
+        layout.addWidget(self.label)
+        layout.addStretch()
+
+        # Hint
+        hint = QLabel("Alt+Z")
+        hint.setFont(QFont(FONT_MONO, FONT_SIZE - 2))
+        hint.setStyleSheet(f"color: {STATUS_COL}; opacity: 0.5;")
+        layout.addWidget(hint)
+
+    def set_state(self, state: str):
+        self._state = state
+        label_text, color = self.STATE_LABELS.get(state, ("", DOT_IDLE))
+        self.dot.setStyleSheet(f"color: {color};")
+        self.label.setText(label_text)
+        self.label.setStyleSheet(f"color: {color};")
+
+
+# ── Ventana principal ─────────────────────────────────────────────────────────
+class OverlayWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[MessageLabel] = []
+        self._setup_window()
+        self._setup_ui()
+        self._connect_signals()
+
+    def _setup_window(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFixedWidth(560)
+        self._position()
+
+    def _position(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = 24
+        y = screen.height() - self.height() - 60
+        self.setGeometry(x, y, self.width(), self.height())
+
+    def _setup_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # Card container
+        self.card = QWidget()
+        self.card.setObjectName("card")
+        self.card.setStyleSheet(f"""
+            #card {{
+                background-color: rgba(15, 17, 23, {BG_ALPHA});
+                border: 1px solid {BORDER};
+                border-radius: 14px;
+            }}
+        """)
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(20, 16, 20, 16)
+        card_layout.setSpacing(0)
+
+        # Scroll area para mensajes
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("background: transparent; border: none;")
+        self.scroll.setMaximumHeight(260)
+        self.scroll.setMinimumHeight(0)
+
+        self.msg_container = QWidget()
+        self.msg_container.setStyleSheet("background: transparent;")
+        self.msg_layout = QVBoxLayout(self.msg_container)
+        self.msg_layout.setContentsMargins(0, 0, 0, 0)
+        self.msg_layout.setSpacing(6)
+        self.msg_layout.addStretch()
+        self.scroll.setWidget(self.msg_container)
+
+        # Separador
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {BORDER}; margin: 8px 0;")
+
+        # Status bar
+        self.status = StatusBar()
+
+        card_layout.addWidget(self.scroll)
+        card_layout.addWidget(sep)
+        card_layout.addWidget(self.status)
+
+        outer.addWidget(self.card)
+
+    def _connect_signals(self):
+        signals.show_window.connect(self._show)
+        signals.hide_window.connect(self.hide)
+        signals.add_user.connect(self._add_user)
+        signals.add_assistant.connect(self._add_assistant)
+        signals.assistant_start.connect(self._assistant_start)
+        signals.assistant_chunk.connect(self._assistant_chunk)
+        signals.assistant_end.connect(self._assistant_end)
+        signals.set_state.connect(self._set_state)
+
+    def _show(self):
+        self.show()
+        self._position()
+        self.raise_()
+
+    def _add_user(self, text: str):
+        self._add_message(text, "user")
+
+    def _add_assistant(self, text: str):
+        self._add_message(text, "assistant")
+
+    # ── Streaming assistant ───────────────────────────────────────────────────
+    def _assistant_start(self):
+        """Crea un label vacío para ir llenando con chunks."""
+        if not self.isVisible():
+            self._show()
+        if len(self.messages) >= 10:
+            oldest = self.messages.pop(0)
+            self.msg_layout.removeWidget(oldest)
+            oldest.deleteLater()
+        lbl = MessageLabel("", "assistant")
+        lbl._raw = ""
+        self.msg_layout.insertWidget(self.msg_layout.count() - 1, lbl)
+        self.messages.append(lbl)
+        self._streaming_label = lbl
+
+    def _assistant_chunk(self, chunk: str):
+        """Añade texto al label en streaming."""
+        if not hasattr(self, "_streaming_label") or self._streaming_label is None:
+            self._assistant_start()
+        lbl = self._streaming_label
+        lbl._raw += chunk
+        # Mostrar texto sin markdown
+        clean = self._clean_for_display(lbl._raw)
+        lbl.setText(lbl._wrap("  " + clean, 58))
+        self._adjust_height()
+        QTimer.singleShot(20, lambda: self.scroll.verticalScrollBar().setValue(
+            self.scroll.verticalScrollBar().maximum()
+        ))
+
+    def _assistant_end(self):
+        self._streaming_label = None
+
+    def _clean_for_display(self, text: str) -> str:
+        import re
+        text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+        text = re.sub(r"`[^`]*`", "", text)
+        text = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", text)
+        text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"^\s*[-*+•]\s+", "• ", text, flags=re.MULTILINE)
+        return text.strip()
+
+    def _add_message(self, text: str, role: str):
+        if not self.isVisible():
+            self._show()
+
+        # Mantener max 10 mensajes
+        if len(self.messages) >= 10:
+            oldest = self.messages.pop(0)
+            self.msg_layout.removeWidget(oldest)
+            oldest.deleteLater()
+
+        lbl = MessageLabel(text, role)
+        # Insertar antes del stretch (último item)
+        self.msg_layout.insertWidget(self.msg_layout.count() - 1, lbl)
+        self.messages.append(lbl)
+
+        # Scroll al fondo
+        QTimer.singleShot(50, lambda: self.scroll.verticalScrollBar().setValue(
+            self.scroll.verticalScrollBar().maximum()
+        ))
+
+        # Ajustar altura de la ventana al contenido
+        self._adjust_height()
+
+    def _adjust_height(self):
+        total_h = sum(m.sizeHint().height() + 6 for m in self.messages)
+        self.scroll.setMinimumHeight(min(total_h + 10, 260))
+        self.adjustSize()
+
+    def _set_state(self, state: str):
+        self.status.set_state(state)
+        if state == "recording" and not self.isVisible():
+            self._show()
+
+    def paintEvent(self, event):
+        # Fondo transparente — el card maneja su propio background
+        pass
+
+
+# ── Socket server ─────────────────────────────────────────────────────────────
+def socket_server():
+    sock_path = Path(SOCK_PATH)
+    sock_path.unlink(missing_ok=True)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(5)
+
+    while True:
+        try:
+            conn, _ = server.accept()
+            threading.Thread(target=handle_conn, args=(conn,), daemon=True).start()
+        except Exception:
+            pass
+
+
+def handle_conn(conn):
+    buf = ""
+    with conn:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buf += data.decode("utf-8", errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    dispatch(msg)
+                except Exception:
+                    pass
+
+
+def dispatch(msg: dict):
+    cmd = msg.get("cmd")
+    if cmd == "show":
+        signals.show_window.emit()
+    elif cmd == "hide":
+        signals.hide_window.emit()
+    elif cmd == "user":
+        signals.add_user.emit(msg.get("text", ""))
+    elif cmd == "assistant":
+        signals.add_assistant.emit(msg.get("text", ""))
+    elif cmd == "assistant_start":
+        signals.assistant_start.emit()
+    elif cmd == "assistant_chunk":
+        signals.assistant_chunk.emit(msg.get("text", ""))
+    elif cmd == "assistant_end":
+        signals.assistant_end.emit()
+    elif cmd == "state":
+        signals.set_state.emit(msg.get("value", "idle"))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    win = OverlayWindow()
+    # No mostrar al inicio — aparece cuando llega el primer mensaje
+
+    threading.Thread(target=socket_server, daemon=True).start()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
