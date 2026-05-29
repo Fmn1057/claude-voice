@@ -1,10 +1,8 @@
 # Claude Voice
 
-Asistente de voz para Linux que controla el escritorio completo usando Claude AI. Activado con **Alt+Z**, transcribe tu voz con Whisper, la envía a Claude con acceso total al sistema, y responde por voz con síntesis de audio neural.
+Asistente de voz para **Linux y Windows** que controla el escritorio completo usando Claude AI. Activado con **Alt+Z**, transcribe tu voz con Whisper, la envía a Claude con acceso total al sistema, y responde por voz con síntesis de audio neural.
 
 ![Linux](https://img.shields.io/badge/Linux-KDE_Plasma_6-blue) ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows) ![Python](https://img.shields.io/badge/Python-3.11+-green) ![Claude](https://img.shields.io/badge/Claude-Sonnet_4-orange)
-
-> **Windows:** ver [windows/README.md](windows/README.md)
 
 ## Características
 
@@ -19,49 +17,53 @@ Asistente de voz para Linux que controla el escritorio completo usando Claude AI
 - Control total del escritorio: mouse, teclado, ventanas, apps, archivos
 - Instala apps, crea documentos, controla Spotify, y más
 
-## Requisitos del sistema
+## Requisitos
 
-- CachyOS / Arch Linux
-- KDE Plasma 6 + Wayland
-- Python 3.11+
-- Claude Code CLI instalado y autenticado
-
-## Dependencias del sistema
-
-```bash
-# Paquetes principales
-sudo pacman -S python python-pip python-faster-whisper python-evdev \
-               mpv spectacle scrot playerctl
-
-# Para el overlay gráfico
-sudo pacman -S python-pyqt6
-
-# Herramientas de escritorio
-sudo pacman -S xdotool ydotool wl-clipboard wmctrl
-```
+|  | Linux | Windows |
+|--|-------|---------|
+| **SO** | CachyOS / Arch Linux | Windows 10/11 (64-bit) |
+| **Entorno** | KDE Plasma 6 + Wayland | — |
+| **Python** | 3.11+ | 3.11+ |
+| **Claude CLI** | ✓ | ✓ |
 
 ## Instalación
 
+### 🐧 Linux (Arch / CachyOS)
+
 ```bash
-# 1. Clonar el repositorio
+# 1. Dependencias del sistema
+sudo pacman -S python python-pip python-faster-whisper python-evdev \
+               python-pyqt6 mpv spectacle scrot playerctl \
+               xdotool ydotool wl-clipboard wmctrl
+
+# 2. Clonar e instalar
 git clone https://github.com/Fmn1057/claude-voice.git ~/Proyectos/claude-voice
 cd ~/Proyectos/claude-voice
-
-# 2. Crear el entorno virtual e instalar dependencias Python
 python3 -m venv venv
 venv/bin/pip install edge-tts webrtcvad sounddevice claude-agent-sdk
 
-# 3. Crear symlinks en ~/.local/bin
+# 3. Symlinks
 for script in daemon ui speak stt; do
     ln -sf ~/Proyectos/claude-voice/bin/claude-voice-$script ~/.local/bin/claude-voice-$script
 done
 ln -sf ~/Proyectos/claude-voice/bin/claude-voice ~/.local/bin/claude-voice
 
-# 4. Instalar el servicio systemd
+# 4. Servicio autostart
 cp systemd/claude-voice.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now claude-voice.service
 ```
+
+### 🪟 Windows 10/11
+
+```powershell
+# Clonar e instalar (PowerShell como administrador)
+git clone https://github.com/Fmn1057/claude-voice.git claude-voice
+cd claude-voice
+powershell -ExecutionPolicy Bypass -File windows\install.ps1
+```
+
+El instalador crea el venv, instala dependencias, instala mpv y configura el autostart automáticamente. Ver [windows/README.md](windows/README.md) para más detalles.
 
 ## Uso
 
@@ -85,14 +87,20 @@ systemctl --user enable --now claude-voice.service
 
 ```
 claude-voice/
-├── bin/
-│   ├── claude-voice-daemon   # Daemon principal: hotkeys, grabación, Claude SDK, TTS
-│   ├── claude-voice-ui       # Overlay flotante PyQt6 con la conversación
-│   ├── claude-voice-speak    # Síntesis de voz (edge-tts + mpv)
-│   └── claude-voice-stt      # Transcripción (faster-whisper)
-├── venv/                     # Entorno virtual Python (no se sube a git)
+├── bin/                          # Scripts Linux
+│   ├── claude-voice-daemon       # Daemon principal: hotkeys, grabación, Claude SDK, TTS
+│   ├── claude-voice-ui           # Overlay flotante PyQt6 con la conversación
+│   ├── claude-voice-speak        # Síntesis de voz (edge-tts + mpv)
+│   └── claude-voice-stt          # Transcripción (faster-whisper)
+├── windows/                      # Scripts Windows
+│   ├── claude-voice-daemon.py    # Daemon adaptado para Windows
+│   ├── claude-voice-ui.py        # Overlay PyQt6 (mismo que Linux)
+│   ├── install.ps1               # Instalador PowerShell automático
+│   ├── launcher.vbs              # Lanzador silencioso para autostart
+│   └── README.md                 # Guía específica Windows
 ├── systemd/
-│   └── claude-voice.service  # Servicio systemd de usuario
+│   └── claude-voice.service      # Servicio systemd (Linux)
+├── venv/                         # Entorno virtual Python (no se sube a git)
 └── README.md
 ```
 
