@@ -4,7 +4,7 @@
 
 VOICE="${CLAUDE_VOICE_TTS_VOICE:-es-MX-DaliaNeural}"
 AUDIO="/tmp/.claude-voice-tts.mp3"
-VENV_EDGE="/home/matias/Proyectos/claude-voice/venv/bin/edge-tts"
+VENV_EDGE="${HOME}/Proyectos/claude-voice/venv/bin/edge-tts"
 
 TEXT="$*"
 [[ -z "$TEXT" ]] && exit 0

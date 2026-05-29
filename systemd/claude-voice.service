@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/home/matias/.local/bin/claude-voice-daemon
+ExecStart=%h/.local/bin/claude-voice-daemon
 Restart=on-failure
 RestartSec=5
 Environment=DISPLAY=:0

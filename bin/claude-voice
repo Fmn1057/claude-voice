@@ -25,7 +25,7 @@ notify_brief() {
 
 speak() {
     load_env
-    /home/matias/Proyectos/claude-voice/bin/claude-voice-speak "$1" >>"$LOGFILE" 2>&1 &
+    ${HOME}/Proyectos/claude-voice/bin/claude-voice-speak "$1" >>"$LOGFILE" 2>&1 &
 }
 
 start_recording() {
