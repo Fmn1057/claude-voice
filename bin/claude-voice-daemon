@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""
+Claude Voice Assistant — daemon completo
+- Alt+Z: empieza a grabar (VAD auto-detecta cuando dejás de hablar)
+- Alt+Z mientras habla Claude: interrumpe la respuesta
+- Claude Agent SDK: sesión persistente con contexto multi-turno
+- TTS streaming: habla oración por oración mientras responde
+"""
+
+import sys
+sys.path.insert(0, "/home/matias/Proyectos/claude-voice/venv/lib/python3.14/site-packages")
+
+import asyncio
+import io
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+import wave
+from enum import Enum, auto
+from pathlib import Path
+
+import evdev
+from evdev import ecodes
+import webrtcvad
+import sounddevice as sd
+
+# ── Configuración ────────────────────────────────────────────────────────────
+
+HOME            = Path.home()
+VENV_EDGE       = Path("/home/matias/Proyectos/claude-voice/venv/bin/edge-tts")
+ENVFILE         = Path("/tmp/.claude-voice-env")
+LOGFILE         = Path("/tmp/.claude-voice.log")
+CLAUDE_BIN      = HOME / ".config/Claude/claude-code/2.1.142/claude"
+UI_SOCK         = Path("/tmp/.claude-voice.sock")
+
+SAMPLE_RATE     = 16000
+FRAME_MS        = 30
+FRAME_SIZE      = int(SAMPLE_RATE * FRAME_MS / 1000)   # 480 samples
+SILENCE_SECS    = 1.8   # silencio para cortar grabación
+MAX_RECORD_SECS = 45
+VAD_AGGRESSION  = 2     # 0-3 (3=más agresivo detectando silencio)
+
+MODEL_SIZE      = os.environ.get("CLAUDE_VOICE_MODEL", "small")
+LANG            = os.environ.get("CLAUDE_VOICE_LANG", "es")
+TTS_VOICE       = os.environ.get("CLAUDE_VOICE_TTS_VOICE", "es-MX-DaliaNeural")
+
+KEY_ALT_L = ecodes.KEY_LEFTALT
+KEY_Z     = ecodes.KEY_Z
+KEY_X     = ecodes.KEY_X
+
+
+# ── Utilidades ───────────────────────────────────────────────────────────────
+
+def session_env() -> dict:
+    env = os.environ.copy()
+    env["PATH"] = f"{HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    if ENVFILE.exists():
+        for line in ENVFILE.read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+    return env
+
+
+def log(msg: str):
+    with open(LOGFILE, "a") as f:
+        f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+
+
+# ── UI overlay (socket) ───────────────────────────────────────────────────────
+
+_ui_conn: socket.socket | None = None
+_ui_lock = threading.Lock()
+
+
+def ui_send(cmd: str, **kwargs):
+    """Envía un mensaje JSON al overlay UI."""
+    global _ui_conn
+    msg = json.dumps({"cmd": cmd, **kwargs}) + "\n"
+    with _ui_lock:
+        if _ui_conn is None and UI_SOCK.exists():
+            try:
+                _ui_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                _ui_conn.connect(str(UI_SOCK))
+            except Exception as e:
+                log(f"ui_connect error: {e}")
+                _ui_conn = None
+        if _ui_conn:
+            try:
+                _ui_conn.sendall(msg.encode())
+            except Exception as e:
+                log(f"ui_send error: {e}")
+                _ui_conn = None  # reconectar próxima vez
+
+
+def strip_markdown(text: str) -> str:
+    # Bloques de código
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"`[^`]+`", "", text)
+    # Sección "Sources:" y todo lo que sigue
+    text = re.sub(r"\bSources?:.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Links markdown [texto](url) → solo texto
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    # Links sueltos [File: algo] o [Imagen: algo]
+    text = re.sub(r"\[[^\]]{0,80}\]", "", text)
+    # URLs sueltas
+    text = re.sub(r"https?://\S+", "", text)
+    # Separadores --- o ===
+    text = re.sub(r"^[\-=]{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Negritas / itálicas
+    text = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", text)
+    text = re.sub(r"_{1,3}([^_\n]+)_{1,3}", r"\1", text)
+    # Títulos
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Bullets
+    text = re.sub(r"^\s*[-*+•]\s+", "", text, flags=re.MULTILINE)
+    # Listas numeradas
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    # Múltiples saltos → pausa
+    text = re.sub(r"\n{2,}", ". ", text)
+    text = text.replace("\n", " ")
+    # Espacios múltiples
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+# ── TTS ──────────────────────────────────────────────────────────────────────
+
+async def speak(text: str, stop: asyncio.Event):
+    """Convierte texto a voz oracion por oracion."""
+    clean = strip_markdown(text)
+    if not clean:
+        return
+
+    # Dividir en oraciones
+    parts = re.split(r"(?<=[.!?])\s+", clean)
+    parts = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
+
+    for part in parts:
+        if stop.is_set():
+            break
+        tmp = Path(tempfile.mktemp(suffix=".mp3"))
+        try:
+            # Generar audio
+            proc = await asyncio.create_subprocess_exec(
+                str(VENV_EDGE), "--voice", TTS_VOICE,
+                "--text", part, "--write-media", str(tmp),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+
+            if stop.is_set() or not tmp.exists():
+                break
+
+            # Reproducir
+            mpv = await asyncio.create_subprocess_exec(
+                "mpv", "--no-terminal", "--really-quiet", str(tmp),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            # Esperar mpv pero revisar stop cada 50ms
+            while mpv.returncode is None:
+                if stop.is_set():
+                    mpv.kill()
+                    await mpv.wait()
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+# ── Grabación manual (toggle) ─────────────────────────────────────────────────
+
+def record_until_stop(stop: threading.Event) -> bytes | None:
+    """Graba continuamente hasta que stop sea activado. Retorna bytes WAV."""
+    frames: list[bytes] = []
+
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                            dtype="int16", blocksize=FRAME_SIZE) as stream:
+            while not stop.is_set():
+                chunk, _ = stream.read(FRAME_SIZE)
+                frames.append(chunk.tobytes())
+    except Exception as e:
+        log(f"record error: {e}")
+        return None
+
+    if not frames:
+        return None
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"".join(frames))
+    return buf.getvalue()
+
+
+# ── Screenshot ───────────────────────────────────────────────────────────────
+
+SCREENSHOT_PATH = Path("/tmp/claude-voice-screenshot.png")
+
+_VISION_KEYWORDS = {
+    "pantalla", "screen", "ves", "ven", "veo", "qué hay", "que hay",
+    "imagen", "dice", "muestra", "screenshot", "foto", "mira", "mirá",
+    "look", "see", "qué ves", "que ves", "qué dice", "que dice",
+    "qué aparece", "que aparece", "qué está", "que esta",
+}
+
+def needs_screenshot(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in _VISION_KEYWORDS)
+
+def _screenshot_valid(path: Path) -> bool:
+    """Verifica que el archivo existe, tiene tamaño razonable y no es todo negro."""
+    if not path.exists() or path.stat().st_size < 5000:
+        return False
+    # Detectar imagen completamente negra (juegos bloqueando captura)
+    try:
+        r = subprocess.run(
+            ["python3", "-c",
+             f"from PIL import Image; img=Image.open('{path}').convert('L'); "
+             f"px=list(img.getdata()); print('black' if max(px)<10 else 'ok')"],
+            capture_output=True, timeout=3
+        )
+        if b"black" in r.stdout:
+            return False
+    except Exception:
+        pass  # sin PIL, confiar en el tamaño
+    return True
+
+
+def take_screenshot() -> bool:
+    """Toma screenshot de pantalla completa. Retorna True si tuvo éxito."""
+    SCREENSHOT_PATH.unlink(missing_ok=True)
+    env = session_env()   # incluye WAYLAND_DISPLAY, XDG_RUNTIME_DIR, etc.
+
+    # 1. spectacle vía KDE portal (mejor para KDE Plasma, funciona con la mayoría de ventanas)
+    try:
+        r = subprocess.run(
+            ["spectacle", "-b", "-n", "-f", "-o", str(SCREENSHOT_PATH)],
+            timeout=6, capture_output=True, env=env,
+        )
+        if _screenshot_valid(SCREENSHOT_PATH):
+            log("Screenshot OK (spectacle -f)")
+            return True
+        else:
+            log(f"spectacle -f falló o imagen negra: rc={r.returncode}")
+    except Exception as e:
+        log(f"spectacle error: {e}")
+
+    # 2. scrot — funciona con ventanas XWayland (juegos como CS2, Steam)
+    try:
+        r = subprocess.run(
+            ["scrot", "-z", str(SCREENSHOT_PATH)],
+            timeout=5, capture_output=True, env=env,
+        )
+        if _screenshot_valid(SCREENSHOT_PATH):
+            log("Screenshot OK (scrot)")
+            return True
+        else:
+            log(f"scrot falló: rc={r.returncode} {r.stderr.decode()[:100]}")
+    except FileNotFoundError:
+        log("scrot no encontrado — instalá con: sudo pacman -S scrot")
+    except Exception as e:
+        log(f"scrot error: {e}")
+
+    # 3. import (ImageMagick) — otro fallback X11
+    try:
+        r = subprocess.run(
+            ["import", "-window", "root", str(SCREENSHOT_PATH)],
+            timeout=5, capture_output=True, env=env,
+        )
+        if _screenshot_valid(SCREENSHOT_PATH):
+            log("Screenshot OK (import/imagemagick)")
+            return True
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"import error: {e}")
+
+    log("Screenshot FALLÓ — sin imagen disponible")
+    return False
+
+
+# ── Transcripción ─────────────────────────────────────────────────────────────
+
+_whisper_model = None
+
+def transcribe(wav_bytes: bytes) -> str:
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(wav_bytes)
+        tmp = f.name
+    try:
+        segs, _ = _whisper_model.transcribe(tmp, language=LANG, vad_filter=True)
+        return " ".join(s.text.strip() for s in segs).strip()
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+# ── Estado ───────────────────────────────────────────────────────────────────
+
+class State(Enum):
+    IDLE       = auto()
+    RECORDING  = auto()
+    PROCESSING = auto()
+    SPEAKING   = auto()
+
+
+# ── Asistente principal ───────────────────────────────────────────────────────
+
+class VoiceAssistant:
+    def __init__(self):
+        self.state         = State.IDLE
+        self.stop_tts      = asyncio.Event()
+        self.stop_rec      = threading.Event()
+        self.trigger_q: asyncio.Queue = None
+        self.loop: asyncio.AbstractEventLoop = None
+        self._response_task: asyncio.Task | None = None
+
+    # ── Hotkey listener (hilo) ───────────────────────────────────────────────
+
+    def _find_keyboards(self):
+        devs = []
+        for path in evdev.list_devices():
+            try:
+                d = evdev.InputDevice(path)
+                caps = d.capabilities()
+                if ecodes.EV_KEY in caps and KEY_Z in caps[ecodes.EV_KEY]:
+                    devs.append(d)
+            except Exception:
+                pass
+        return devs
+
+    def _listen_device(self, dev: evdev.InputDevice):
+        alt = False
+        try:
+            for ev in dev.read_loop():
+                if ev.type != ecodes.EV_KEY:
+                    continue
+                if ev.code == KEY_ALT_L:
+                    alt = (ev.value != 0)
+
+                if ev.value != 1 or not alt:   # solo key-down con alt
+                    continue
+
+                if ev.code == KEY_Z:
+                    if self.state == State.SPEAKING:
+                        # Stop directo sin pasar por la cola (el loop está bloqueado en speak())
+                        self.loop.call_soon_threadsafe(self.stop_tts.set)
+                    else:
+                        asyncio.run_coroutine_threadsafe(
+                            self.trigger_q.put("toggle"), self.loop
+                        )
+
+                elif ev.code == KEY_X:
+                    # Hard stop — cancela todo inmediatamente
+                    self.loop.call_soon_threadsafe(self._hard_stop_sync)
+
+        except Exception:
+            pass
+
+    def _hard_stop_sync(self):
+        """Llamado desde el loop (thread-safe). Cancela TODO: grabación, TTS, task de respuesta y subprocesos."""
+        self.stop_tts.set()
+        self.stop_rec.set()
+
+        # Cancela la coroutine que está esperando la respuesta de Claude
+        if self._response_task and not self._response_task.done():
+            self._response_task.cancel()
+
+        # Mata el subproceso del Claude CLI que el SDK está corriendo
+        subprocess.Popen(
+            ["pkill", "-KILL", "-f", "claude-code"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        # Mata mpv (TTS en curso)
+        subprocess.Popen(
+            ["pkill", "-KILL", "mpv"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        self.state = State.IDLE
+        ui_send("state", value="idle")
+        ui_send("assistant_end")
+
+    def start_hotkey_listener(self):
+        devs = self._find_keyboards()
+        if not devs:
+            print("ERROR: no se encontraron teclados", file=sys.stderr)
+            return
+        print(f"Monitoreando {len(devs)} dispositivo(s). Atajo: Alt+Z", flush=True)
+        for d in devs:
+            threading.Thread(target=self._listen_device, args=(d,), daemon=True).start()
+
+    # ── Loop principal ───────────────────────────────────────────────────────
+
+    async def run(self):
+        from claude_agent_sdk import (
+            ClaudeSDKClient, ClaudeAgentOptions,
+            AssistantMessage, TextBlock, ResultMessage,
+        )
+
+        self.loop      = asyncio.get_running_loop()
+        self.trigger_q = asyncio.Queue()
+
+        self.start_hotkey_listener()
+
+        SYSTEM_PROMPT = """Eres un asistente de voz que controla el escritorio Linux del usuario (CachyOS, KDE Plasma 6, Wayland).
+
+REGLAS CRÍTICAS:
+- ACTÚA PRIMERO, explica después. Nunca planifiques en voz alta — simplemente ejecutá.
+- Preferí SIEMPRE comandos bash sobre navegar interfaces gráficas. Es más rápido y confiable.
+- Respuestas MUY cortas: máximo 1-2 oraciones después de actuar.
+- Nunca uses markdown, listas, corchetes ni asteriscos.
+- No digas lo que vas a hacer, hacelo y después confirmá brevemente.
+
+TAREAS RÁPIDAS — siempre usá el camino más directo:
+
+CREAR PRESENTACIONES (PPT/PPTX):
+- python3-pptx está instalado. Usalo directamente via bash, sin instalar nada.
+- Ejemplo para PPT de 3 slides en ~/Escritorio/nombre.pptx:
+  python3 << 'EOF'
+  from pptx import Presentation; from pptx.util import Inches, Pt; from pptx.dml.color import RGBColor
+  prs = Presentation()
+  def add_slide(prs, title, body):
+      slide = prs.slides.add_slide(prs.slide_layouts[1])
+      slide.shapes.title.text = title
+      slide.placeholders[1].text = body
+  add_slide(prs, "Título", "Contenido")
+  prs.save('/home/matias/Escritorio/presentacion.pptx')
+  EOF
+- Abrí el archivo con: xdg-open /home/matias/Escritorio/presentacion.pptx
+
+CREAR DOCUMENTOS (txt, md, py, etc.):
+- Usá bash con heredoc o python3 para escribir el archivo directamente.
+
+SPOTIFY Y MÚSICA:
+- Abrir Spotify y reproducir algo al azar: spotify & sleep 3 && playerctl -p spotify shuffle on && playerctl -p spotify play
+- Si Spotify ya está abierto: playerctl -p spotify shuffle on && playerctl -p spotify play
+- Reproducir artista/canción específica (abre la URI directamente): spotify --uri "spotify:search:nombre artista" &
+- Pausar/reanudar: playerctl -p spotify play-pause
+- Siguiente canción: playerctl -p spotify next
+- Volumen: playerctl -p spotify volume 0.8
+- Ver qué está sonando: playerctl -p spotify metadata --format "{{artist}} - {{title}}"
+- NUNCA uses xdg-open con URLs de Spotify para reproducir — usá playerctl + URIs directas
+- Si playerctl no está instalado: sudo pacman -S playerctl
+
+CONTROL DEL ESCRITORIO — comandos disponibles vía Bash:
+- Abrir apps: xdg-open <archivo/url>, o directamente: firefox, konsole, code, steam, etc.
+- Mouse (XWayland): xdotool mousemove <x> <y>, xdotool click 1
+- Teclado (XWayland): xdotool type "texto", xdotool key ctrl+c
+- Mouse/teclado Wayland nativo: YDOTOOL_SOCKET=/run/user/1000/.ydotool_socket ydotool mousemove --absolute -x <x> -y <y>, ydotool click 0x110, ydotool type "texto", ydotool key ctrl+c
+  IMPORTANTE: siempre usar --absolute en mousemove para evitar movimientos relativos acumulados
+- Ventanas: xdotool search --name "titulo" windowfocus, wmctrl -a "titulo"
+- Portapapeles: wl-copy "texto", wl-paste
+- Notificaciones: notify-send "título" "mensaje"
+- KDE: qdbus6 org.kde.* para controlar KDE
+- Procesos: pkill <nombre>, kill <pid>
+
+VER PANTALLA:
+- Screenshot actualizado en /tmp/claude-voice-screenshot.png — léelo con Read cuando el usuario pregunte qué hay en pantalla
+- Si el screenshot está en negro o no existe: el juego está en fullscreen exclusivo bloqueando la captura. En ese caso, pedile al usuario que describa lo que ve O usá tu conocimiento del juego para responder igual. NUNCA digas "no puedo capturar la pantalla" — simplemente respondé con lo que sabés o preguntá brevemente.
+- CS2/Steam: si no podés ver la pantalla, igual podés ayudar con comandos de consola del juego
+
+SISTEMA:
+- Instalar: paru -S <paquete> o sudo pacman -S <paquete>
+- Servicios: sudo systemctl start/stop/enable <servicio>
+- Todo sudo funciona sin contraseña
+
+El usuario habla en español. Responde SIEMPRE en español."""
+
+        options = ClaudeAgentOptions(
+            permission_mode="bypassPermissions",
+            system_prompt=SYSTEM_PROMPT,
+            model="claude-sonnet-4-6",
+            cwd=HOME,
+        )
+
+        # Pre-cargar modelo Whisper
+        log("Cargando modelo Whisper...")
+        await self.loop.run_in_executor(None, lambda: transcribe(
+            # dummy WAV mínimo
+            b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+            b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+        ))
+
+        # Iniciar UI overlay
+        ui_proc = subprocess.Popen(
+            [sys.executable, str(Path("/home/matias/Proyectos/claude-voice/bin/claude-voice-ui"))],
+            env=session_env(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        await asyncio.sleep(1.5)   # esperar que el socket esté listo
+
+        first_start = True
+        while True:     # reconectar si la sesión Claude se cae
+            try:
+                async with ClaudeSDKClient(options=options) as client:
+                    if first_start:
+                        await speak("Sistema de voz listo", asyncio.Event())
+                        first_start = False
+                    ui_send("state", value="idle")
+                    print("Listo. Alt+Z para hablar.", flush=True)
+
+                    while True:
+                        await self.trigger_q.get()
+
+                        if self.state in (State.SPEAKING, State.PROCESSING):
+                            continue
+
+                        # ── Grabar ───────────────────────────────────────
+                        self.state = State.RECORDING
+                        self.stop_rec.clear()
+                        ui_send("state", value="recording")
+
+                        rec_task = asyncio.ensure_future(
+                            self.loop.run_in_executor(None, record_until_stop, self.stop_rec)
+                        )
+                        await self.trigger_q.get()      # segundo Alt+Z
+                        self.stop_rec.set()
+                        wav = await rec_task
+
+                        if not wav or len(wav) < 8000:
+                            ui_send("state", value="idle")
+                            self.state = State.IDLE
+                            continue
+
+                        # ── Transcribir ───────────────────────────────────
+                        self.state = State.PROCESSING
+                        ui_send("state", value="processing")
+                        text = await self.loop.run_in_executor(None, transcribe, wav)
+                        log(f"Transcripción: {text!r}")
+
+                        if not text:
+                            await speak("No entendí", asyncio.Event())
+                            ui_send("state", value="idle")
+                            self.state = State.IDLE
+                            continue
+
+                        ui_send("user", text=text)
+                        claude_query = text
+                        if needs_screenshot(text):
+                            ok = await self.loop.run_in_executor(None, take_screenshot)
+                            if ok:
+                                claude_query = (
+                                    f"{text}\n\n"
+                                    f"[Acabo de tomar un screenshot de la pantalla completa. "
+                                    f"Está en {SCREENSHOT_PATH}. Leélo con Read AHORA para responder.]"
+                                )
+                                log(f"Screenshot OK, incluyendo en query")
+
+                        # ── Claude ────────────────────────────────────────
+                        self.state = State.SPEAKING
+                        self.stop_tts.clear()
+                        ui_send("state", value="speaking")
+
+                        try:
+                            buf = {"full": "", "sent": ""}
+                            ui_send("assistant_start")
+                            await client.query(claude_query)
+
+                            async def _recv():
+                                interrupted = False
+                                async for msg in client.receive_response():
+                                    # Cuando el usuario interrumpe (Alt+Z), señalamos a Claude
+                                    # que pare pero SEGUIMOS drenando el generator hasta que
+                                    # se agote — así no quedan mensajes en el buffer del SDK
+                                    # que contaminarían la siguiente pregunta.
+                                    if self.stop_tts.is_set() and not interrupted:
+                                        interrupted = True
+                                        try:
+                                            await client.interrupt()
+                                        except Exception:
+                                            pass
+                                    if interrupted:
+                                        continue   # drenar silenciosamente
+                                    if isinstance(msg, AssistantMessage):
+                                        for block in msg.content:
+                                            if isinstance(block, TextBlock):
+                                                buf["full"] += block.text
+                                                buf["sent"] += block.text
+                                                ui_send("assistant_chunk", text=block.text)
+                                                while re.search(r"[.!?]\s", buf["sent"]):
+                                                    m = re.search(r"[.!?]\s", buf["sent"])
+                                                    sentence = buf["sent"][:m.end()].strip()
+                                                    buf["sent"] = buf["sent"][m.end():]
+                                                    if sentence and not self.stop_tts.is_set():
+                                                        await speak(sentence, self.stop_tts)
+
+                            self._response_task = asyncio.ensure_future(_recv())
+                            try:
+                                await self._response_task
+                            except asyncio.CancelledError:
+                                log("Respuesta cancelada por Alt+X")
+                            finally:
+                                self._response_task = None
+
+                            if buf["sent"].strip() and not self.stop_tts.is_set():
+                                await speak(buf["sent"], self.stop_tts)
+
+                            if not buf["full"].strip() and not self.stop_tts.is_set():
+                                await speak("Listo", asyncio.Event())
+                                ui_send("assistant_chunk", text="Listo.")
+
+                            ui_send("assistant_end")
+                            log(f"Respuesta: {buf['full'][:120]!r}{'...' if len(buf['full'])>120 else ''}")
+
+                        except asyncio.CancelledError:
+                            log("Task cancelada")
+                            ui_send("assistant_end")
+                        except Exception as e:
+                            log(f"Claude SDK error: {e}")
+                            ui_send("assistant_end")
+                            killed_by_user = self.stop_tts.is_set()
+                            if "143" in str(e) or "137" in str(e) or "exit code" in str(e).lower():
+                                if not killed_by_user:
+                                    await speak("Sesión caída, reconectando", asyncio.Event())
+                                raise   # sale del async with → reconecta
+                            else:
+                                await speak("Hubo un error, intentá de nuevo", asyncio.Event())
+
+                        self.stop_tts.clear()
+                        ui_send("state", value="idle")
+                        self.state = State.IDLE
+
+            except Exception as e:
+                log(f"Sesión caída: {e} — reconectando en 2s")
+                self.state = State.IDLE
+                ui_send("state", value="idle")
+                await asyncio.sleep(2)
+
+
+# ── Entrada ───────────────────────────────────────────────────────────────────
+
+async def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
+    print("Claude Voice Daemon iniciando...", flush=True)
+    await VoiceAssistant().run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

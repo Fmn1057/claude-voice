@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Toggle voice recording → Whisper STT → Claude → TTS
+# Alt+Z: primer press graba, segundo press transcribe y responde por voz
+
+PIDFILE="/tmp/.claude-voice-rec.pid"
+WAVFILE="/tmp/.claude-voice-input.wav"
+ENVFILE="/tmp/.claude-voice-env"
+LOGFILE="/tmp/.claude-voice.log"
+
+MODEL="${CLAUDE_VOICE_MODEL:-small}"
+LANG="${CLAUDE_VOICE_LANG:-es}"
+
+save_env() {
+    printenv | grep -E "^(WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|HOME|PATH)=" > "$ENVFILE"
+}
+
+load_env() {
+    [[ -f "$ENVFILE" ]] && set -a && source "$ENVFILE" && set +a
+}
+
+notify_brief() {
+    load_env
+    notify-send --urgency=low --expire-time=2000 "Claude Voice" "$1" 2>>"$LOGFILE"
+}
+
+speak() {
+    load_env
+    /home/matias/Proyectos/claude-voice/bin/claude-voice-speak "$1" >>"$LOGFILE" 2>&1 &
+}
+
+start_recording() {
+    save_env
+    rm -f "$WAVFILE"
+    speak "Escuchando"
+    arecord -f S16_LE -r 16000 -c 1 -t wav "$WAVFILE" 2>>"$LOGFILE" &
+    local rec_pid=$!
+    [[ "$rec_pid" -gt 0 ]] && echo "$rec_pid" > "$PIDFILE"
+}
+
+stop_and_send() {
+    load_env
+
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [[ -z "$pid" ]] || [[ "$pid" -le 0 ]]; then
+        rm -f "$PIDFILE"
+        return
+    fi
+
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+
+    if [[ ! -s "$WAVFILE" ]]; then
+        speak "No escuché nada"
+        return
+    fi
+
+    speak "Un momento"
+
+    local text
+    text=$(python3 ~/.local/bin/claude-voice-stt "$WAVFILE" "$MODEL" "$LANG" 2>>"$LOGFILE" | xargs)
+
+    if [[ -z "$text" ]]; then
+        speak "No entendí"
+        return
+    fi
+
+    # Show what was understood as a brief notification (optional, remove if too noisy)
+    notify_brief "«$text»"
+
+    # Ask Claude (headless, full permissions)
+    local response
+    response=$(claude --print --dangerously-skip-permissions "$text" 2>>"$LOGFILE")
+
+    if [[ -z "$response" ]]; then
+        speak "Claude no respondió"
+        return
+    fi
+
+    # Speak the response
+    speak "$response"
+}
+
+if [[ -f "$PIDFILE" ]]; then
+    stop_and_send
+else
+    start_recording
+fi

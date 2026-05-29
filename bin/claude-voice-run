@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs inside the floating terminal spawned by claude-voice
+# Receives the transcribed prompt as $1 and sends it to the claude CLI
+
+PROMPT="$*"
+
+echo "═══════════════════════════════════════"
+echo " Claude Voice"
+echo "═══════════════════════════════════════"
+echo " Prompt: $PROMPT"
+echo "───────────────────────────────────────"
+echo
+
+claude --print --dangerously-skip-permissions "$PROMPT"
+
+echo
+echo "───────────────────────────────────────"
+read -rp "Presiona Enter para cerrar..."

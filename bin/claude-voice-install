@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run this once in a real terminal to install the faster-whisper dependency
+set -e
+
+echo "=== Instalando python-faster-whisper ==="
+paru -S --noconfirm python-faster-whisper
+
+echo
+echo "=== Descargando modelo Whisper 'small' (~244MB) ==="
+python3 - <<'PYEOF'
+from faster_whisper import WhisperModel
+print("Descargando modelo 'small'...")
+WhisperModel("small", device="cpu", compute_type="int8")
+print("Modelo listo.")
+PYEOF
+
+echo
+echo "=== Recargando atajos KDE ==="
+kquitapp6 khotkeys 2>/dev/null || true
+sleep 1
+khotkeys &
+sleep 1
+
+echo
+echo "=== Listo ==="
+echo "Usa Alt+Z para empezar a grabar y Alt+Z de nuevo para enviar a Claude."

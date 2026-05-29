@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+# Transcribe audio file using faster-whisper and print the result to stdout
+import sys
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: claude-voice-stt <audio_file> [model_size] [language]", file=sys.stderr)
+        sys.exit(1)
+
+    audio_file = sys.argv[1]
+    model_size = sys.argv[2] if len(sys.argv) > 2 else "small"
+    language   = sys.argv[3] if len(sys.argv) > 3 else "es"
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("ERROR: faster-whisper not installed. Run: pip install faster-whisper", file=sys.stderr)
+        sys.exit(1)
+
+    # Use CUDA if available, otherwise CPU with int8 quantization
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        device = "cpu"
+
+    compute_type = "float16" if device == "cuda" else "int8"
+
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    segments, _ = model.transcribe(audio_file, language=language, vad_filter=True)
+    text = " ".join(s.text.strip() for s in segments)
+    print(text.strip())
+
+if __name__ == "__main__":
+    main()

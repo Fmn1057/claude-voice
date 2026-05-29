@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Voice Daemon (Alt+Z global hotkey)
+After=graphical-session.target plasma-workspace.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/matias/.local/bin/claude-voice-daemon
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=graphical-session.target
